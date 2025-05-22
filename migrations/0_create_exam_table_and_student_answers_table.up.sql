@@ -18,6 +18,7 @@ CREATE TABLE student_answers (
                                  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), -- UUID as primary key
                                  exam_id TEXT NOT NULL,                         -- Exam ID
                                  item_id TEXT NOT NULL,                         -- Question ID
+                                 block_id TEXT UNIQUE NOT NULL,                     -- Block ID
                                  student_id TEXT NOT NULL,                      -- Student ID
                                  answer_list JSON NOT NULL,                    -- Student answers (JSON format)
                                  created_at TIMESTAMP DEFAULT NOW(),            -- Creation timestamp
