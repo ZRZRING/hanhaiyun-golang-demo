@@ -7,22 +7,27 @@ CREATE TABLE exam_items (
                             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), -- UUID as primary key
                             exam_id TEXT NOT NULL,                         -- Exam ID
                             item_id TEXT NOT NULL UNIQUE,                  -- Question ID
-                            body TEXT NOT NULL,                            -- Question body
-                            correct_answer TEXT NOT NULL,                  -- Correct answer
+                            body_result TEXT NOT NULL,                            -- Question body
+                            correct_answer_result TEXT NOT NULL,                  -- Correct answer
+                            body TEXT NOT NULL,                            -- Question body in text format
+                            correct_answer TEXT NOT NULL,                  -- Correct answer in text format
                             created_at TIMESTAMP DEFAULT NOW(),            -- Creation timestamp
                             updated_at TIMESTAMP DEFAULT NOW()             -- Last updated timestamp
 );
 
 -- Table for student answers
-CREATE TABLE student_answers (
-                                 id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), -- UUID as primary key
-                                 exam_id TEXT NOT NULL,                         -- Exam ID
-                                 item_id TEXT NOT NULL,                         -- Question ID
-                                 block_id TEXT UNIQUE NOT NULL,                     -- Block ID
-                                 student_id TEXT NOT NULL,                      -- Student ID
-                                 answer_list JSON NOT NULL,                    -- Student answers (JSON format)
-                                 created_at TIMESTAMP DEFAULT NOW(),            -- Creation timestamp
-                                 updated_at TIMESTAMP DEFAULT NOW()            -- Last updated timestamp
+CREATE TABLE tasks (
+                       id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), -- UUID as primary key
+                       task_id TEXT NOT NULL,                        -- Task ID
+                       exam_id TEXT NOT NULL,                         -- Exam ID
+                       block_id TEXT UNIQUE NOT NULL,                 -- Block ID
+                       student_id TEXT NOT NULL,                      -- Student ID
+                       item_id TEXT NOT NULL,                         -- Question ID
+                       answer TEXT NOT NULL,                     -- Student answers (JSON format)
+                       status TEXT NOT NULL DEFAULT 'pending',        -- Task status (e.g., pending, processing, completed, failed)
+                       result JSON,                                   -- Task result (e.g., score or error details)
+                       created_at TIMESTAMP DEFAULT NOW(),            -- Creation timestamp
+                       updated_at TIMESTAMP DEFAULT NOW()             -- Last updated timestamp
 );
 
 -- Create a function to automatically update the updated_at column
@@ -40,7 +45,7 @@ CREATE TRIGGER set_updated_at_exam_items
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
-CREATE TRIGGER set_updated_at_student_answers
-    BEFORE UPDATE ON student_answers
+CREATE TRIGGER set_updated_at_tasks
+    BEFORE UPDATE ON tasks
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();

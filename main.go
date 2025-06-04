@@ -4,6 +4,7 @@ import (
 	"examination-papers/configs"
 	"examination-papers/controllers"
 	"examination-papers/data/db"
+	"examination-papers/data/redis"
 	"examination-papers/middleware"
 	"examination-papers/routes"
 	"github.com/gofiber/fiber/v2"
@@ -32,8 +33,19 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	examCase := controllers.NewSubmitExamCase(dbClient.DB, nil)
+	redisConfig := redis.Config{
+		Host:     "localhost",
+		Port:     6379,
+		Password: "eYVX7EwVmmxKPCDmwMtyKVge8oLd2t81",
+		DB:       0,
+	}
+	redisClient, err := redis.NewRedisClient(redisConfig)
+	if err != nil {
+		panic(err)
+	}
+	examCase := controllers.NewSubmitExamCase(dbClient.DB, nil, redisClient.Client)
+	go examCase.SubmitExamWorker()
 	routes.PublicRoutes(app, examCase)
 
-	app.Listen(":3000")
+	app.Listen(":3001")
 }
