@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"examination-papers/data/storage"
@@ -8,12 +9,21 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 	"log"
+	"net/http"
+	"os"
 	"time"
 )
 
-const TASKSQUEUE = "tasks_queue"
+const QUESTIONTASKSQUEUE = "question_tasks_queue"
+const STUDENTANSWERSQUEUE = "student_answers_queue"
+
+// get env
+var HANDLEANSWERAPPID = os.Getenv("HANDLE_ANSWER_APPID")
+var HANDLEQUESTIONAPPID = os.Getenv("HANDLE_QUESTION_APPID")
+var EXAMPAPERSMATHAPPID = os.Getenv("EXAM_PAPER_MATH_APPID")
 
 type SubmitExamCase struct {
 	db          *sqlx.DB
@@ -60,6 +70,16 @@ type ExamItemTask struct {
 	Answer string `json:"answer" validate:"required"`  // Question answer
 }
 
+type ExamStudentAnswerTask struct {
+	BlockID   string   `json:"block_id" validate:"required"`        // Unique ID for the answer block
+	ExamID    string   `json:"exam_id" validate:"required"`         // Exam ID
+	ItemID    string   `json:"item_id" validate:"required"`         // Question ID
+	StudentID string   `json:"student_id" validate:"required"`      // Student ID
+	Answers   []string `json:"answer" validate:"required,dive,url"` // Student's answer list (image URLs)
+	SubmitId  string   `json:"submit_id" validate:"required"`       // Unique ID for the submission
+	Callback  string   `json:"callback" validate:"required,url"`    // Callback URL for result notification
+}
+
 func (sc *SubmitExamCase) SubmitExamController(c *fiber.Ctx) error {
 	var req SubmitExamRequest
 	log.Printf("[SubmitExamController] Received request: %s", c.Body())
@@ -92,7 +112,7 @@ func (sc *SubmitExamCase) SubmitExamController(c *fiber.Ctx) error {
 			})
 		}
 		ctx := context.Background()
-		err = sc.redisClient.LPush(ctx, TASKSQUEUE, taskBytes).Err()
+		err = sc.redisClient.LPush(ctx, QUESTIONTASKSQUEUE, taskBytes).Err()
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"code":    1,
@@ -110,7 +130,7 @@ func (sc *SubmitExamCase) SubmitExamController(c *fiber.Ctx) error {
 func (sc *SubmitExamCase) SubmitExamWorker() {
 	for {
 		ctx := context.Background()
-		result, err := sc.redisClient.BLPop(ctx, 0, TASKSQUEUE).Result()
+		result, err := sc.redisClient.BLPop(ctx, 0, QUESTIONTASKSQUEUE).Result()
 		if err != nil {
 			log.Printf("[Worker] Redis BRPop error: %v", err)
 			time.Sleep(time.Second)
@@ -134,16 +154,27 @@ func (sc *SubmitExamCase) SubmitExamWorker() {
 			"answer": examTask.Answer,
 		}
 
-		// ⚡ 调用外部 API（AgentRequest）
-		resp, err := utils.AgentRequest("3ac741b8e2a34451b8527b407bf289ac", bizParams)
+		// 处理 answer
+		answerResp, err := utils.AgentRequest(HANDLEANSWERAPPID, bizParams)
 		if err != nil {
 			log.Printf("[Worker] AgentRequest error: %v", err)
 			continue
 		}
 
+		// 调用外部api 处理 body
+		bodyParams := map[string]interface{}{
+			"question": examTask.Body,
+		}
+		// 处理 原问题
+		bodyResp, err := utils.AgentRequest(HANDLEQUESTIONAPPID, bodyParams)
+		if err != nil {
+			log.Printf("[Worker] AgentRequest error for body: %v", err)
+			continue
+		}
+
 		// todo : be upsert
 		query := `INSERT INTO exam_items (exam_id, item_id, body, correct_answer, body_result, correct_answer_result) VALUES ($1, $2, $3, $4, $5, $6)`
-		_, err = sc.db.Exec(query, examTask.ExamID, examTask.ItemID, examTask.Body, examTask.Answer, "", resp.Text)
+		_, err = sc.db.Exec(query, examTask.ExamID, examTask.ItemID, examTask.Body, examTask.Answer, bodyResp.Text, answerResp.Text)
 		if err != nil {
 			log.Printf("[Worker] Failed to insert exam item: %v", err)
 			continue
@@ -153,68 +184,176 @@ func (sc *SubmitExamCase) SubmitExamWorker() {
 
 func (sc *SubmitExamCase) SubmitAnswerController(c *fiber.Ctx) error {
 	var req SubmitAnswerRequest
-	err := c.BodyParser(&req)
-	if err != nil {
+	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"code":    1,
 			"message": "Invalid request body",
 		})
 	}
 
+	submitId := uuid.NewString()
+	sc.redisClient.Set(context.Background(), "submit:"+submitId, len(req.StudentAnswers), 120*time.Second) // 2小时过期
+
 	tx, err := sc.db.Beginx()
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"code":    1,
-			"message": "Failed to begin transaction",
-		})
+		return fiber.NewError(fiber.StatusInternalServerError, "DB error")
 	}
-	// insert task in db
-	taskId := uuid.New()
-	for _, answer := range req.StudentAnswers {
-		query := `INSERT INTO tasks (task_id, exam_id, block_id, student_id, item_id, answer) VALUES ($1, $2, $3, $4, $5, $6)`
-		_, err := tx.Exec(query, taskId, req.ExamID, answer.BlockID, answer.StudentID, answer.ItemID, answer.AnswerList)
+
+	for _, ans := range req.StudentAnswers {
+		query := `INSERT INTO exam_blocks 
+			(block_id, exam_id, student_id, item_id, answer, callback, status) 
+			VALUES ($1, $2, $3, $4, $5, $6, 'pending')`
+		_, err := tx.Exec(query, ans.BlockID, req.ExamID, ans.StudentID, ans.ItemID, pq.Array(ans.AnswerList), req.Callback)
 		if err != nil {
-			log.Printf("Failed to insert task: %v", err)
 			tx.Rollback()
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-				"code":    1,
-				"message": "Failed to insert task",
-			})
+			log.Printf("[SubmitAnswerController] Insert failed for student answer: %v", err)
+			return fiber.NewError(fiber.StatusInternalServerError, "Insert failed for student answer")
 		}
+
+		// 同步推入 Redis 队列（每道题为单位）
+		task := ExamStudentAnswerTask{
+			BlockID:   ans.BlockID,
+			ExamID:    req.ExamID,
+			ItemID:    ans.ItemID,
+			StudentID: ans.StudentID,
+			Answers:   ans.AnswerList,
+			Callback:  req.Callback,
+			SubmitId:  submitId,
+		}
+		payload, _ := json.Marshal(task)
+		sc.redisClient.RPush(context.Background(), STUDENTANSWERSQUEUE, payload)
 	}
-	err = tx.Commit()
+
+	if err := tx.Commit(); err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "Commit failed")
+	}
+
 	return c.JSON(fiber.Map{
 		"code":    0,
-		"message": "Tasks submitted successfully",
+		"message": "Submitted successfully",
 	})
-	//
-	//for _, answer := range req.StudentAnswers {
-	//
-	//}
-	// todo : need implement
 }
 
-func (sc *SubmitExamCase) notifyCallback(callbackURL, blockID string, result *utils.AgentResult) {
-	// todo : need implement
+func (sc *SubmitExamCase) SubmitAnswerWorker() {
+	for {
+		ctx := context.Background()
+		result, err := sc.redisClient.BLPop(ctx, 0, STUDENTANSWERSQUEUE).Result()
+		if err != nil {
+			log.Printf("[SubmitAnswerWorker] Redis BLPop error: %v", err)
+			time.Sleep(time.Second)
+			continue
+		}
+		// result[0] 是 queue name，result[1] 是数据
+		if len(result) < 2 {
+			continue
+		}
+		data := result[1]
+		var task ExamStudentAnswerTask
+		if err := json.Unmarshal([]byte(data), &task); err != nil {
+			log.Printf("[SubmitAnswerWorker] JSON decode failed: %v", err)
+			continue
+		}
+		log.Printf("[SubmitAnswerWorker] Processing answer for block: %s, exam: %s, student: %s", task.BlockID, task.ExamID, task.StudentID)
+		// 根据 ItemID 获取题目详情
+		query := `SELECT body_result, correct_answer_result FROM exam_items WHERE item_id = $1`
+		var bodyResult, correctAnswerResult string
+		err = sc.db.QueryRow(query, task.ItemID).Scan(&bodyResult, &correctAnswerResult)
+		if err != nil {
+			log.Printf("[SubmitAnswerWorker] Failed to fetch item details: %v", err)
+			continue
+		}
+		// 调用判卷方法
+		bizParams := map[string]interface{}{
+			"studentAnswer": task.Answers[0], // todo : 目前数学只处理第一个答案
+			// "body":          bodyResult,
+			"correctAnswer": correctAnswerResult,
+		}
+		// 批卷子
+		taskResult, err := utils.AgentRequest(EXAMPAPERSMATHAPPID, bizParams)
+		if err != nil {
+			log.Printf("[SubmitAnswerWorker] AgentRequest error: %v", err)
+			continue
+		}
+		log.Printf("Process successful!")
+		// 更新数据库
+		updateQuery := `UPDATE exam_blocks SET status = 'completed', result = $1 WHERE block_id = $2`
+		_, err = sc.db.Exec(updateQuery, taskResult.Text, task.BlockID)
+		if err != nil {
+			log.Printf("[SubmitAnswerWorker] Failed to update exam block: %v", err)
+			continue
+		}
+
+		resultItem := map[string]string{
+			"block_id":   task.BlockID,
+			"item_id":    task.ItemID,
+			"student_id": task.StudentID,
+			"result":     taskResult.Text,
+		}
+		resultJSON, _ := json.Marshal(resultItem)
+		sc.redisClient.RPush(ctx, "submit:result:"+task.SubmitId, resultJSON)
+
+		submitKey := "submit:" + task.SubmitId
+		remaining, err := sc.redisClient.Decr(context.Background(), submitKey).Result()
+		if err != nil {
+			log.Printf("[SubmitAnswerWorker] Redis DECR error: %v", err)
+			continue
+		}
+
+		if remaining == 0 {
+			lockKey := "submit:lock:" + task.SubmitId
+			ok, _ := sc.redisClient.SetNX(context.Background(), lockKey, "1", 5*time.Second).Result()
+			if ok {
+				resultList, err := sc.redisClient.LRange(context.Background(), "submit:result:"+task.SubmitId, 0, -1).Result()
+				if err != nil {
+					log.Printf("[SubmitAnswerWorker] Redis LRange error: %v", err)
+					return
+				}
+
+				var results []map[string]interface{}
+				for _, r := range resultList {
+					var item map[string]interface{}
+					if err := json.Unmarshal([]byte(r), &item); err == nil {
+						results = append(results, item)
+					}
+				}
+
+				sc.notifyCallback(task, taskResult)
+			}
+		}
+	}
 }
 
-func (sc *SubmitExamCase) processAnswersAsync(req SubmitAnswerRequest) {
-	//go func() {
-	//	for _, answer := range req.StudentAnswers {
-	//		// Process each answer asynchronously
-	//		// get itemUrl by itemId
-	//
-	//		result, err := utils.AgentMathScore(itemurl, answer.AnswerList[0])
-	//		if err != nil {
-	//			log.Printf("Error processing answer for block %s: %v", answer.BlockID, err)
-	//			continue
-	//		}
-	//
-	//		// Notify callback URL with the result
-	//		sc.notifyCallback(req.Callback, answer.BlockID, result)
-	//	}
-	//}()
-}
+func (sc *SubmitExamCase) notifyCallback(task ExamStudentAnswerTask, agentResult *utils.AgentResult) {
+	resultData := map[string]interface{}{
+		"exam_id": task.ExamID,
+		"student_result": []map[string]interface{}{
+			{
+				"student_id": task.StudentID, // 学生ID
+				"item_id":    task.ItemID,    // 试题ID
+				"result": map[string]string{
+					"block_id": task.BlockID,
+					"result":   agentResult.Text,
+				},
+			},
+		},
+	}
+	// 将结果转换为 JSON
+	resultJSON, err := json.Marshal(resultData)
+	if err != nil {
+		log.Printf("[notifyCallback] JSON marshal error: %v", err)
+		return
+	}
 
-//// 处理标准答案
-//func (sc SubmitExamCase) ProcessStandardAnswer()
+	// 发起 HTTP POST 请求
+	resp, err := http.Post(task.Callback, "application/json", bytes.NewReader(resultJSON))
+	if err != nil {
+		log.Printf("[notifyCallback] POST request error: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	// 简单检查响应状态码
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("[notifyCallback] Callback returned non-200 status: %d", resp.StatusCode)
+	}
+}

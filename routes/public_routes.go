@@ -13,4 +13,5 @@ func PublicRoutes(a *fiber.App, sc *controllers.SubmitExamCase) {
 	// Routes for GET method:
 	// route.Get("/books", controllers.GetBooks)   // get list of all books
 	route.Post("/submit_exam", sc.SubmitExamController)
+	route.Post("/submit_student_answer", sc.SubmitAnswerController)
 }

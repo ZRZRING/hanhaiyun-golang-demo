@@ -44,7 +44,12 @@ func main() {
 		panic(err)
 	}
 	examCase := controllers.NewSubmitExamCase(dbClient.DB, nil, redisClient.Client)
-	go examCase.SubmitExamWorker()
+	for i := 0; i < 5; i++ { // 启动 5 个 worker
+		go examCase.SubmitExamWorker()
+	}
+	for i := 0; i < 2; i++ {
+		go examCase.SubmitAnswerWorker()
+	}
 	routes.PublicRoutes(app, examCase)
 
 	app.Listen(":3001")

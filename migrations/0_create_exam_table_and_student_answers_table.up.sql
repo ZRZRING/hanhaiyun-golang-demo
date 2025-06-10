@@ -16,16 +16,16 @@ CREATE TABLE exam_items (
 );
 
 -- Table for student answers
-CREATE TABLE tasks (
+CREATE TABLE exam_blocks (
                        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), -- UUID as primary key
-                       task_id TEXT NOT NULL,                        -- Task ID
                        exam_id TEXT NOT NULL,                         -- Exam ID
                        block_id TEXT UNIQUE NOT NULL,                 -- Block ID
                        student_id TEXT NOT NULL,                      -- Student ID
                        item_id TEXT NOT NULL,                         -- Question ID
-                       answer TEXT NOT NULL,                     -- Student answers (JSON format)
+                       answer TEXT[] NOT NULL,                     -- Student answers (JSON format)
                        status TEXT NOT NULL DEFAULT 'pending',        -- Task status (e.g., pending, processing, completed, failed)
-                       result JSON,                                   -- Task result (e.g., score or error details)
+                       result TEXT,
+                       callback TEXT NOT NULL,                        -- Task result (e.g., score or error details)
                        created_at TIMESTAMP DEFAULT NOW(),            -- Creation timestamp
                        updated_at TIMESTAMP DEFAULT NOW()             -- Last updated timestamp
 );
@@ -46,6 +46,6 @@ CREATE TRIGGER set_updated_at_exam_items
     EXECUTE FUNCTION update_updated_at_column();
 
 CREATE TRIGGER set_updated_at_tasks
-    BEFORE UPDATE ON tasks
+    BEFORE UPDATE ON exam_blocks
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
