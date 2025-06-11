@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"time"
+	_ "github.com/joho/godotenv/autoload"
 )
 
 const QUESTIONTASKSQUEUE = "question_tasks_queue"
