@@ -9,13 +9,13 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	_ "github.com/joho/godotenv/autoload"
 	"github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 	"log"
 	"net/http"
 	"os"
 	"time"
-	_ "github.com/joho/godotenv/autoload"
 )
 
 const QUESTIONTASKSQUEUE = "question_tasks_queue"
@@ -25,6 +25,7 @@ const STUDENTANSWERSQUEUE = "student_answers_queue"
 var HANDLEANSWERAPPID = os.Getenv("HANDLE_ANSWER_APPID")
 var HANDLEQUESTIONAPPID = os.Getenv("HANDLE_QUESTION_APPID")
 var EXAMPAPERSMATHAPPID = os.Getenv("EXAM_PAPER_MATH_APPID")
+var HANDLESCOREAPPID = os.Getenv("HANDLE_SCORE_APPID")
 
 type SubmitExamCase struct {
 	db          *sqlx.DB
@@ -46,9 +47,10 @@ type SubmitExamRequest struct {
 }
 
 type Item struct {
-	ItemID string `json:"item_id" validate:"required"` // Question ID
-	Body   string `json:"body" validate:"required"`    // Question body
-	Answer string `json:"answer" validate:"required"`  // Question answer
+	ItemID    string `json:"item_id" validate:"required"`    // Question ID
+	Body      string `json:"body" validate:"required"`       // Question body
+	Answer    string `json:"answer" validate:"required"`     // Question answer
+	FullScore string `json:"full_score" validate:"required"` // Maximum score for the question
 }
 
 type SubmitAnswerRequest struct {
@@ -65,10 +67,11 @@ type StudentAnswer struct {
 }
 
 type ExamItemTask struct {
-	ExamID string `json:"exam_id" validate:"required"` // Exam ID
-	ItemID string `json:"item_id" validate:"required"` // Question ID
-	Body   string `json:"body" validate:"required"`    // Question body
-	Answer string `json:"answer" validate:"required"`  // Question answer
+	ExamID    string `json:"exam_id" validate:"required"`    // Exam ID
+	ItemID    string `json:"item_id" validate:"required"`    // Question ID
+	Body      string `json:"body" validate:"required"`       // Question body
+	Answer    string `json:"answer" validate:"required"`     // Question answer
+	FullScore string `json:"full_score" validate:"required"` // Maximum score for the question
 }
 
 type ExamStudentAnswerTask struct {
@@ -100,10 +103,11 @@ func (sc *SubmitExamCase) SubmitExamController(c *fiber.Ctx) error {
 
 	for _, item := range req.Items {
 		task := ExamItemTask{
-			ExamID: req.ExamID,
-			ItemID: item.ItemID,
-			Body:   item.Body,
-			Answer: item.Answer,
+			ExamID:    req.ExamID,
+			ItemID:    item.ItemID,
+			Body:      item.Body,
+			Answer:    item.Answer,
+			FullScore: item.FullScore,
 		}
 		taskBytes, err := json.Marshal(task)
 		if err != nil {
@@ -152,7 +156,8 @@ func (sc *SubmitExamCase) SubmitExamWorker() {
 
 		// 构造调用参数
 		bizParams := map[string]interface{}{
-			"answer": examTask.Answer,
+			"answer":     examTask.Answer,
+			"full_score": examTask.FullScore,
 		}
 
 		// 处理 answer
@@ -180,6 +185,7 @@ func (sc *SubmitExamCase) SubmitExamWorker() {
 			log.Printf("[Worker] Failed to insert exam item: %v", err)
 			continue
 		}
+		log.Printf("[Worker] Successfully processed exam item: %s", examTask.ItemID)
 	}
 }
 
@@ -283,12 +289,32 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 			log.Printf("[SubmitAnswerWorker] Failed to update exam block: %v", err)
 			continue
 		}
+		// 请求百炼智能体 分析分数
+		scoreRes, err := utils.AgentRequest(HANDLESCOREAPPID, map[string]interface{}{
+			"res": taskResult.Text,
+		})
+
+		if err != nil {
+			log.Printf("[SubmitAnswerWorker] AgentRequest for score error: %v", err)
+			continue
+		}
+		var scoreResult struct {
+			FullScore string `json:"full_score"`
+			Score     string `json:"score"`
+		}
+		err = json.Unmarshal([]byte(scoreRes.Text), &scoreResult)
+		if err != nil {
+			log.Printf("[SubmitAnswerWorker] JSON unmarshal for score error: %v", err)
+			continue
+		}
 
 		resultItem := map[string]string{
 			"block_id":   task.BlockID,
 			"item_id":    task.ItemID,
 			"student_id": task.StudentID,
 			"result":     taskResult.Text,
+			"score":      scoreResult.Score,
+			"full_score": scoreResult.FullScore,
 		}
 		resultJSON, _ := json.Marshal(resultItem)
 		sc.redisClient.RPush(ctx, "submit:result:"+task.SubmitId, resultJSON)
@@ -310,50 +336,70 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 					return
 				}
 
-				var results []map[string]interface{}
-				for _, r := range resultList {
-					var item map[string]interface{}
-					if err := json.Unmarshal([]byte(r), &item); err == nil {
-						results = append(results, item)
-					}
-				}
-
-				sc.notifyCallback(task, taskResult)
+				sc.notifyCallback(task, resultList)
 			}
 		}
 	}
 }
 
-func (sc *SubmitExamCase) notifyCallback(task ExamStudentAnswerTask, agentResult *utils.AgentResult) {
-	resultData := map[string]interface{}{
-		"exam_id": task.ExamID,
-		"student_result": []map[string]interface{}{
-			{
-				"student_id": task.StudentID, // 学生ID
-				"item_id":    task.ItemID,    // 试题ID
-				"result": map[string]string{
-					"block_id": task.BlockID,
-					"result":   agentResult.Text,
-				},
+type CallbackPayload struct {
+	ExamID        string          `json:"exam_id"`
+	StudentResult []StudentResult `json:"student_result"`
+}
+
+type StudentResult struct {
+	StudentID string       `json:"student_id"`
+	ItemID    string       `json:"item_id"`
+	BlockID   string       `json:"block_id"`
+	Result    ResultDetail `json:"result"`
+}
+
+type ResultDetail struct {
+	OverAllFeedBack string `json:"over_all_feed_back"`
+	Score           string `json:"score"`
+	FullScore       string `json:"full_score"`
+	Time            string `json:"time"`
+}
+
+func (sc *SubmitExamCase) notifyCallback(task ExamStudentAnswerTask, resultList []string) {
+	var studentResults []StudentResult
+	for _, res := range resultList {
+		var resMap map[string]interface{}
+		err := json.Unmarshal([]byte(res), &resMap)
+		if err != nil {
+			log.Printf("[notifyCallback] JSON unmarshal error: %v", err)
+			continue
+		}
+		studentResults = append(studentResults, StudentResult{
+			StudentID: task.StudentID,
+			ItemID:    task.ItemID,
+			BlockID:   task.BlockID,
+			Result: ResultDetail{
+				Score:           resMap["score"].(string),
+				FullScore:       resMap["full_score"].(string),
+				OverAllFeedBack: resMap["result"].(string),
+				Time:            time.Now().Format(time.RFC3339), // 使用当前时间作为时间戳
 			},
-		},
+		})
 	}
-	// 将结果转换为 JSON
-	resultJSON, err := json.Marshal(resultData)
+	payload := CallbackPayload{
+		ExamID:        task.ExamID,
+		StudentResult: studentResults,
+	}
+	payloadJson, err := json.Marshal(payload)
 	if err != nil {
 		log.Printf("[notifyCallback] JSON marshal error: %v", err)
 		return
 	}
-
-	// 发起 HTTP POST 请求
-	resp, err := http.Post(task.Callback, "application/json", bytes.NewReader(resultJSON))
+	log.Printf(string(payloadJson))
+	// 发送 HTTP POST 请求
+	resp, err := http.Post(task.Callback, "application/json", bytes.NewReader(payloadJson))
 	if err != nil {
 		log.Printf("[notifyCallback] POST request error: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
-	// 简单检查响应状态码
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		log.Printf("[notifyCallback] Callback returned non-200 status: %d", resp.StatusCode)
 	}
