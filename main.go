@@ -8,6 +8,8 @@ import (
 	"examination-papers/middleware"
 	"examination-papers/routes"
 	"github.com/gofiber/fiber/v2"
+	_ "github.com/joho/godotenv/autoload"
+	"os"
 )
 
 func main() {
@@ -51,6 +53,6 @@ func main() {
 		go examCase.SubmitAnswerWorker()
 	}
 	routes.PublicRoutes(app, examCase)
-
-	app.Listen(":3001")
+	port := os.Getenv("PORT")
+	app.Listen(port)
 }
