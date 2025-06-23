@@ -20,6 +20,8 @@ import (
 
 const QUESTIONTASKSQUEUE = "question_tasks_queue"
 const STUDENTANSWERSQUEUE = "student_answers_queue"
+const SUBMITIDEXAMSUB = "submit_exam:"
+const SUBMITIDANSWERSUB = "submit:answer:"
 
 // get env
 var HANDLEANSWERAPPID = os.Getenv("HANDLE_ANSWER_APPID")
@@ -105,7 +107,7 @@ func (sc *SubmitExamCase) SubmitExamController(c *fiber.Ctx) error {
 	}
 	ctx := context.Background()
 	submitId := uuid.NewString()
-	sc.redisClient.Set(ctx, "submit_exam:"+submitId, len(req.Items), 4*time.Hour)
+	sc.redisClient.Set(ctx, SUBMITIDEXAMSUB+submitId, len(req.Items), 4*time.Hour)
 	for _, item := range req.Items {
 		task := ExamItemTask{
 			ExamID:    req.CardID,
@@ -200,7 +202,7 @@ func (sc *SubmitExamCase) SubmitExamWorker() {
 			updated_at = NOW()
 `
 		_, err = sc.db.Exec(query, examTask.ExamID, examTask.ItemID, examTask.Body, examTask.Answer, bodyResp.Text, answerResp.Text)
-		remaining, err := sc.redisClient.Decr(ctx, "submit_exam:"+examTask.SubmitId).Result()
+		remaining, err := sc.redisClient.Decr(ctx, SUBMITIDEXAMSUB+examTask.SubmitId).Result()
 		if err != nil {
 			log.Printf("[Worker] Failed to insert exam item: %v", err)
 			continue
@@ -208,12 +210,15 @@ func (sc *SubmitExamCase) SubmitExamWorker() {
 
 		log.Printf("[Worker] Successfully processed exam item: %s", examTask.ItemID)
 
-		if remaining == 0 {
+		if remaining <= 0 {
 			lockKey := "submit_exam:lock:" + examTask.SubmitId
 			ok, _ := sc.redisClient.SetNX(ctx, lockKey, "1", 5*time.Second).Result()
 			if ok {
 				// 执行回调
 				sc.notifyExamCallback(examTask)
+
+				sc.redisClient.Del(ctx, SUBMITIDEXAMSUB+examTask.SubmitId)
+				sc.redisClient.Del(ctx, lockKey)
 			}
 		}
 	}
@@ -229,7 +234,7 @@ func (sc *SubmitExamCase) SubmitAnswerController(c *fiber.Ctx) error {
 	}
 
 	submitId := uuid.NewString()
-	sc.redisClient.Set(context.Background(), "submit:"+submitId, len(req.StudentAnswers), 120*time.Second) // 2小时过期
+	sc.redisClient.Set(context.Background(), SUBMITIDANSWERSUB+submitId, len(req.StudentAnswers), 120*time.Second) // 2小时过期
 
 	tx, err := sc.db.Beginx()
 	if err != nil {
@@ -349,17 +354,18 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 		resultJSON, _ := json.Marshal(resultItem)
 		sc.redisClient.RPush(ctx, "submit:result:"+task.SubmitId, resultJSON)
 
-		submitKey := "submit:" + task.SubmitId
+		submitKey := SUBMITIDANSWERSUB + task.SubmitId
 		remaining, err := sc.redisClient.Decr(context.Background(), submitKey).Result()
 		if err != nil {
 			log.Printf("[SubmitAnswerWorker] Redis DECR error: %v", err)
 			continue
 		}
 
-		if remaining == 0 {
+		if remaining <= 0 {
 			lockKey := "submit:lock:" + task.SubmitId
 			ok, _ := sc.redisClient.SetNX(context.Background(), lockKey, "1", 5*time.Second).Result()
 			if ok {
+				resultKey := "submit:result:" + task.SubmitId
 				resultList, err := sc.redisClient.LRange(context.Background(), "submit:result:"+task.SubmitId, 0, -1).Result()
 				if err != nil {
 					log.Printf("[SubmitAnswerWorker] Redis LRange error: %v", err)
@@ -367,6 +373,10 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 				}
 
 				sc.notifyCallback(task, resultList)
+
+				sc.redisClient.Del(context.Background(), SUBMITIDANSWERSUB+task.SubmitId)
+				sc.redisClient.Del(context.Background(), resultKey)
+				sc.redisClient.Del(context.Background(), lockKey)
 			}
 		}
 	}
