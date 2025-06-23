@@ -42,8 +42,9 @@ func NewSubmitExamCase(db *sqlx.DB, minioClient *storage.MinioClient, redisClien
 }
 
 type SubmitExamRequest struct {
-	ExamID string `json:"exam_id" validate:"required"`
-	Items  []Item `json:"items" validate:"required,dive"` // List of questions
+	CardID   string `json:"card_id" validate:"required"`
+	Callback string `json:"callback" validate:"required"`   // 回调地址
+	Items    []Item `json:"items" validate:"required,dive"` // List of questions
 }
 
 type Item struct {
@@ -71,6 +72,8 @@ type ExamItemTask struct {
 	ItemID    string `json:"item_id" validate:"required"`    // Question ID
 	Body      string `json:"body" validate:"required"`       // Question body
 	Answer    string `json:"answer" validate:"required"`     // Question answer
+	SubmitId  string `json:"submit_id" validate:"required"`  // Unique ID for the submission
+	CallBack  string `json:"callback" validate:"required"`   // Callback URL for result notification
 	FullScore string `json:"full_score" validate:"required"` // Maximum score for the question
 }
 
@@ -94,20 +97,24 @@ func (sc *SubmitExamCase) SubmitExamController(c *fiber.Ctx) error {
 		})
 	}
 
-	if req.ExamID == "" || len(req.Items) == 0 {
+	if req.CardID == "" || len(req.Items) == 0 {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"code":    1,
 			"message": "Exam ID and items are required",
 		})
 	}
-
+	ctx := context.Background()
+	submitId := uuid.NewString()
+	sc.redisClient.Set(ctx, "submit_exam:"+submitId, len(req.Items), 4*time.Hour)
 	for _, item := range req.Items {
 		task := ExamItemTask{
-			ExamID:    req.ExamID,
+			ExamID:    req.CardID,
 			ItemID:    item.ItemID,
 			Body:      item.Body,
 			Answer:    item.Answer,
 			FullScore: item.FullScore,
+			CallBack:  req.Callback,
+			SubmitId:  submitId,
 		}
 		taskBytes, err := json.Marshal(task)
 		if err != nil {
@@ -116,7 +123,7 @@ func (sc *SubmitExamCase) SubmitExamController(c *fiber.Ctx) error {
 				"message": "Failed to serialize task",
 			})
 		}
-		ctx := context.Background()
+
 		err = sc.redisClient.LPush(ctx, QUESTIONTASKSQUEUE, taskBytes).Err()
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -179,13 +186,36 @@ func (sc *SubmitExamCase) SubmitExamWorker() {
 		}
 
 		// todo : be upsert
-		query := `INSERT INTO exam_items (exam_id, item_id, body, correct_answer, body_result, correct_answer_result) VALUES ($1, $2, $3, $4, $5, $6)`
+		query := `
+		INSERT INTO exam_items (
+			exam_id, item_id, body, correct_answer, body_result, correct_answer_result
+		) VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (item_id)
+		DO UPDATE SET
+		exam_id = EXCLUDED.exam_id,
+			body = EXCLUDED.body,
+			correct_answer = EXCLUDED.correct_answer,
+			body_result = EXCLUDED.body_result,
+			correct_answer_result = EXCLUDED.correct_answer_result,
+			updated_at = NOW()
+`
 		_, err = sc.db.Exec(query, examTask.ExamID, examTask.ItemID, examTask.Body, examTask.Answer, bodyResp.Text, answerResp.Text)
+		remaining, err := sc.redisClient.Decr(ctx, "submit_exam:"+examTask.SubmitId).Result()
 		if err != nil {
 			log.Printf("[Worker] Failed to insert exam item: %v", err)
 			continue
 		}
+
 		log.Printf("[Worker] Successfully processed exam item: %s", examTask.ItemID)
+
+		if remaining == 0 {
+			lockKey := "submit_exam:lock:" + examTask.SubmitId
+			ok, _ := sc.redisClient.SetNX(ctx, lockKey, "1", 5*time.Second).Result()
+			if ok {
+				// 执行回调
+				sc.notifyExamCallback(examTask)
+			}
+		}
 	}
 }
 
@@ -402,5 +432,22 @@ func (sc *SubmitExamCase) notifyCallback(task ExamStudentAnswerTask, resultList 
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		log.Printf("[notifyCallback] Callback returned non-200 status: %d", resp.StatusCode)
+	}
+}
+
+func (sc *SubmitExamCase) notifyExamCallback(task ExamItemTask) {
+	payload := map[string]interface{}{
+		"card_id": task.ExamID,
+		"result":  "Done",
+	}
+	payloadJson, _ := json.Marshal(payload)
+	resp, err := http.Post(task.CallBack, "application/json", bytes.NewReader(payloadJson))
+	if err != nil {
+		log.Printf("[notifyExamCallback] POST request error: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("[notifyExamCallback] Callback returned non-200 status: %d", resp.StatusCode)
 	}
 }
