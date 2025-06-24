@@ -353,6 +353,7 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 		}
 		resultJSON, _ := json.Marshal(resultItem)
 		sc.redisClient.RPush(ctx, "submit:result:"+task.SubmitId, resultJSON)
+		log.Printf("[SubmitAnswerWorker] RPush result: block_id=%s item_id=%s", task.BlockID, task.ItemID)
 
 		submitKey := SUBMITIDANSWERSUB + task.SubmitId
 		remaining, err := sc.redisClient.Decr(context.Background(), submitKey).Result()
@@ -365,12 +366,24 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 			lockKey := "submit:lock:" + task.SubmitId
 			ok, _ := sc.redisClient.SetNX(context.Background(), lockKey, "1", 5*time.Second).Result()
 			if ok {
+				time.Sleep(1000 * time.Millisecond)
 				resultKey := "submit:result:" + task.SubmitId
 				resultList, err := sc.redisClient.LRange(context.Background(), "submit:result:"+task.SubmitId, 0, -1).Result()
 				if err != nil {
 					log.Printf("[SubmitAnswerWorker] Redis LRange error: %v", err)
 					return
 				}
+				// 确保数量等于 expectedCount 再发 callback
+				//if len(resultList) == expectedCount {
+				//	sc.notifyCallback(task, resultList)
+				//	// 清理
+				//	sc.redisClient.Del(ctx, submitKey)
+				//	sc.redisClient.Del(ctx, resultKey)
+				//	sc.redisc.Del(ctx, lockKey)
+				//} else {
+				//	log.Printf("Callback skipped: incomplete result list. Got %d, expected %d", len(resultList), expectedCount)
+				//}
+				//
 
 				sc.notifyCallback(task, resultList)
 
@@ -410,14 +423,21 @@ func (sc *SubmitExamCase) notifyCallback(task ExamStudentAnswerTask, resultList 
 			log.Printf("[notifyCallback] JSON unmarshal error: %v", err)
 			continue
 		}
+		studentId, _ := resMap["student_id"].(string)
+		itemId, _ := resMap["item_id"].(string)
+		blockId, _ := resMap["block_id"].(string)
+		score, _ := resMap["score"].(string)
+		fullScore, _ := resMap["full_score"].(string)
+		result, _ := resMap["result"].(string)
+
 		studentResults = append(studentResults, StudentResult{
-			StudentID: task.StudentID,
-			ItemID:    task.ItemID,
-			BlockID:   task.BlockID,
+			StudentID: studentId,
+			ItemID:    itemId,
+			BlockID:   blockId,
 			Result: ResultDetail{
-				Score:           resMap["score"].(string),
-				MaxScore:        resMap["full_score"].(string),
-				OverAllFeedBack: resMap["result"].(string),
+				Score:           score,
+				MaxScore:        fullScore,
+				OverAllFeedBack: result,
 				Time:            time.Now().Format(time.RFC3339), // 使用当前时间作为时间戳
 			},
 		})
@@ -431,7 +451,7 @@ func (sc *SubmitExamCase) notifyCallback(task ExamStudentAnswerTask, resultList 
 		log.Printf("[notifyCallback] JSON marshal error: %v", err)
 		return
 	}
-	log.Printf(string(payloadJson))
+	log.Printf("callback answer" + string(payloadJson))
 	// 发送 HTTP POST 请求
 	resp, err := http.Post(task.Callback, "application/json", bytes.NewReader(payloadJson))
 	if err != nil {
