@@ -395,9 +395,9 @@ type StudentResult struct {
 }
 
 type ResultDetail struct {
-	OverAllFeedBack string `json:"over_all_feed_back"`
+	OverAllFeedBack string `json:"overall_feedback"`
 	Score           string `json:"score"`
-	FullScore       string `json:"full_score"`
+	MaxScore        string `json:"max_score"`
 	Time            string `json:"time"`
 }
 
@@ -416,7 +416,7 @@ func (sc *SubmitExamCase) notifyCallback(task ExamStudentAnswerTask, resultList 
 			BlockID:   task.BlockID,
 			Result: ResultDetail{
 				Score:           resMap["score"].(string),
-				FullScore:       resMap["full_score"].(string),
+				MaxScore:        resMap["full_score"].(string),
 				OverAllFeedBack: resMap["result"].(string),
 				Time:            time.Now().Format(time.RFC3339), // 使用当前时间作为时间戳
 			},
