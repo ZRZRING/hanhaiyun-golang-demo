@@ -98,6 +98,21 @@ func AgentMathScore(question, answer string) (*AgentResult, error) {
 	}, nil
 }
 
+func RetryAgentRequest(appIdEnv string, bizParams map[string]interface{}, retries int) (*AgentResult, error) {
+	var err error
+	var result *AgentResult
+
+	for i := 0; i < retries; i++ {
+		result, err = AgentRequest(appIdEnv, bizParams)
+		if err == nil {
+			return result, nil
+		}
+		log.Printf("Retry %d/%d failed: %v", i+1, retries, err)
+	}
+
+	return nil, fmt.Errorf("All retries failed: %v", err)
+}
+
 func AgentRequest(appIdEnv string, bizParams map[string]interface{}) (*AgentResult, error) {
 	apiKey := os.Getenv("DASHSCOPE_API_KEY")
 

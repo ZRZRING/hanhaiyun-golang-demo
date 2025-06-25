@@ -170,7 +170,7 @@ func (sc *SubmitExamCase) SubmitExamWorker() {
 		}
 
 		// 处理 answer
-		answerResp, err := utils.AgentRequest(HANDLEANSWERAPPID, bizParams)
+		answerResp, err := utils.RetryAgentRequest(HANDLEANSWERAPPID, bizParams, 3)
 		if err != nil {
 			log.Printf("[Worker] AgentRequest error: %v", err)
 			continue
@@ -181,13 +181,12 @@ func (sc *SubmitExamCase) SubmitExamWorker() {
 			"question": examTask.Body,
 		}
 		// 处理 原问题
-		bodyResp, err := utils.AgentRequest(HANDLEQUESTIONAPPID, bodyParams)
+		bodyResp, err := utils.RetryAgentRequest(HANDLEQUESTIONAPPID, bodyParams, 3)
 		if err != nil {
 			log.Printf("[Worker] AgentRequest error for body: %v", err)
 			continue
 		}
 
-		// todo : be upsert
 		query := `
 		INSERT INTO exam_items (
 			exam_id, item_id, body, correct_answer, body_result, correct_answer_result
@@ -311,7 +310,7 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 			"correctAnswer": correctAnswerResult,
 		}
 		// 批卷子
-		taskResult, err := utils.AgentRequest(EXAMPAPERSMATHAPPID, bizParams)
+		taskResult, err := utils.RetryAgentRequest(EXAMPAPERSMATHAPPID, bizParams, 3)
 		if err != nil {
 			log.Printf("[SubmitAnswerWorker] AgentRequest error: %v", err)
 			continue
@@ -325,9 +324,9 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 			continue
 		}
 		// 请求百炼智能体 分析分数
-		scoreRes, err := utils.AgentRequest(HANDLESCOREAPPID, map[string]interface{}{
+		scoreRes, err := utils.RetryAgentRequest(HANDLESCOREAPPID, map[string]interface{}{
 			"res": taskResult.Text,
-		})
+		}, 3)
 
 		if err != nil {
 			log.Printf("[SubmitAnswerWorker] AgentRequest for score error: %v", err)
