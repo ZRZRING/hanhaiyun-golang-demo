@@ -9,6 +9,7 @@ import (
 	"examination-papers/routes"
 	"github.com/gofiber/fiber/v2"
 	_ "github.com/joho/godotenv/autoload"
+	"log"
 	"os"
 )
 
@@ -53,6 +54,7 @@ func main() {
 		go examCase.SubmitAnswerWorker()
 	}
 	routes.PublicRoutes(app, examCase)
+	log.Printf("Starting server on port %s", os.Getenv("PORT"))
 	port := os.Getenv("PORT")
 	app.Listen(port)
 }

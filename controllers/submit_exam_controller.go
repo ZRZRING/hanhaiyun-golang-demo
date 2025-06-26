@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -278,6 +279,7 @@ func (sc *SubmitExamCase) SubmitAnswerController(c *fiber.Ctx) error {
 func (sc *SubmitExamCase) SubmitAnswerWorker() {
 	for {
 		ctx := context.Background()
+
 		result, err := sc.redisClient.BLPop(ctx, 0, STUDENTANSWERSQUEUE).Result()
 		if err != nil {
 			log.Printf("[SubmitAnswerWorker] Redis BLPop error: %v", err)
@@ -310,45 +312,89 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 			"correctAnswer": correctAnswerResult,
 		}
 		// 批卷子
+		taskResultText := ""
+		isSuccess := true
 		taskResult, err := utils.RetryAgentRequest(EXAMPAPERSMATHAPPID, bizParams, 3)
 		if err != nil {
 			log.Printf("[SubmitAnswerWorker] AgentRequest error: %v", err)
-			continue
+			isSuccess = false
+			taskResultText = "批卷失败，请检查！"
+		} else {
+			log.Printf("Process successful!")
+			taskResultText = taskResult.Text
 		}
-		log.Printf("Process successful!")
 		// 更新数据库
 		updateQuery := `UPDATE exam_blocks SET status = 'completed', result = $1 WHERE block_id = $2`
-		_, err = sc.db.Exec(updateQuery, taskResult.Text, task.BlockID)
+		_, err = sc.db.Exec(updateQuery, taskResultText, task.BlockID)
 		if err != nil {
 			log.Printf("[SubmitAnswerWorker] Failed to update exam block: %v", err)
 			continue
 		}
 		// 请求百炼智能体 分析分数
-		scoreRes, err := utils.RetryAgentRequest(HANDLESCOREAPPID, map[string]interface{}{
-			"res": taskResult.Text,
-		}, 3)
+		scoreRequestRetryCount := 3
+		//scoreRes, err := utils.RetryAgentRequest(HANDLESCOREAPPID, map[string]interface{}{
+		//	"res": taskResult.Text,
+		//}, 3)
+		//
+		//if err != nil {
+		//	log.Printf("[SubmitAnswerWorker] AgentRequest for score error: %v", err)
+		//	continue
+		//}
+		//var scoreResult struct {
+		//	FullScore string `json:"full_score"`
+		//	Score     string `json:"score"`
+		//}
+		//err = json.Unmarshal([]byte(scoreRes.Text), &scoreResult)
+		//if err != nil {
+		//	log.Printf("[SubmitAnswerWorker] JSON unmarshal for score error: %v", err)
+		//	continue
+		//}
 
-		if err != nil {
-			log.Printf("[SubmitAnswerWorker] AgentRequest for score error: %v", err)
-			continue
-		}
 		var scoreResult struct {
 			FullScore string `json:"full_score"`
 			Score     string `json:"score"`
 		}
-		err = json.Unmarshal([]byte(scoreRes.Text), &scoreResult)
-		if err != nil {
-			log.Printf("[SubmitAnswerWorker] JSON unmarshal for score error: %v", err)
-			continue
+
+		scoreSuccess := false
+		if isSuccess {
+			// 仅当判卷成功，才尝试打分
+			for i := 0; i < scoreRequestRetryCount; i++ {
+				scoreRes, err := utils.RetryAgentRequest(HANDLESCOREAPPID, map[string]interface{}{
+					"res": taskResultText,
+				}, 3)
+				if err != nil {
+					log.Printf("[SubmitAnswerWorker] AgentRequest for score error (attempt %d/%d): %v", i+1, scoreRequestRetryCount, err)
+					continue
+				}
+				err = json.Unmarshal([]byte(scoreRes.Text), &scoreResult)
+				if err != nil {
+					log.Printf("[SubmitAnswerWorker] JSON unmarshal for score error (attempt %d/%d): %v", i+1, scoreRequestRetryCount, err)
+					continue
+				}
+				scoreSuccess = true
+				break
+			}
+
+			if !scoreSuccess {
+				log.Printf("[SubmitAnswerWorker] Score evaluation failed after retries.")
+				isSuccess = false
+				scoreResult.FullScore = "0"
+				scoreResult.Score = "0"
+			}
+		} else {
+			// 判卷失败就不评分，直接填0分
+			scoreResult.FullScore = "0"
+			scoreResult.Score = "0"
 		}
 
 		resultItem := map[string]string{
 			"block_id":   task.BlockID,
 			"item_id":    task.ItemID,
 			"student_id": task.StudentID,
-			"result":     taskResult.Text,
+			"result":     taskResultText,
 			"score":      scoreResult.Score,
 			"full_score": scoreResult.FullScore,
+			"status":     strconv.FormatBool(isSuccess),
 		}
 		resultJSON, _ := json.Marshal(resultItem)
 		sc.redisClient.RPush(ctx, "submit:result:"+task.SubmitId, resultJSON)
@@ -372,17 +418,6 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 					log.Printf("[SubmitAnswerWorker] Redis LRange error: %v", err)
 					return
 				}
-				// 确保数量等于 expectedCount 再发 callback
-				//if len(resultList) == expectedCount {
-				//	sc.notifyCallback(task, resultList)
-				//	// 清理
-				//	sc.redisClient.Del(ctx, submitKey)
-				//	sc.redisClient.Del(ctx, resultKey)
-				//	sc.redisc.Del(ctx, lockKey)
-				//} else {
-				//	log.Printf("Callback skipped: incomplete result list. Got %d, expected %d", len(resultList), expectedCount)
-				//}
-				//
 
 				sc.notifyCallback(task, resultList)
 
@@ -403,6 +438,7 @@ type StudentResult struct {
 	StudentID string       `json:"student_id"`
 	ItemID    string       `json:"item_id"`
 	BlockID   string       `json:"block_id"`
+	Status    string       `json:"status"`
 	Result    ResultDetail `json:"result"`
 }
 
@@ -428,11 +464,13 @@ func (sc *SubmitExamCase) notifyCallback(task ExamStudentAnswerTask, resultList 
 		score, _ := resMap["score"].(string)
 		fullScore, _ := resMap["full_score"].(string)
 		result, _ := resMap["result"].(string)
+		status, _ := resMap["status"].(string)
 
 		studentResults = append(studentResults, StudentResult{
 			StudentID: studentId,
 			ItemID:    itemId,
 			BlockID:   blockId,
+			Status:    status,
 			Result: ResultDetail{
 				Score:           score,
 				MaxScore:        fullScore,
