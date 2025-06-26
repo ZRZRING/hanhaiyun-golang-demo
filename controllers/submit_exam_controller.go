@@ -404,7 +404,10 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 		}
 
 		resultJSON, _ := json.Marshal(resultItem)
-		sc.redisClient.RPush(ctx, "submit:result:"+task.SubmitId, resultJSON)
+		_, err = sc.redisClient.RPush(ctx, "submit:result:"+task.SubmitId, resultJSON).Result()
+		if err != nil {
+			log.Printf("[SubmitAnswerWorker] Redis RPush error: %v, block_id = %s", err, task.BlockID)
+		}
 		log.Printf("[SubmitAnswerWorker] RPush result: block_id=%s item_id=%s", task.BlockID, task.ItemID)
 
 		if remaining <= 0 {
