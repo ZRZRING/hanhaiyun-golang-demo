@@ -396,10 +396,6 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 			"full_score": scoreResult.FullScore,
 			"status":     strconv.FormatBool(isSuccess),
 		}
-		resultJSON, _ := json.Marshal(resultItem)
-		sc.redisClient.RPush(ctx, "submit:result:"+task.SubmitId, resultJSON)
-		log.Printf("[SubmitAnswerWorker] RPush result: block_id=%s item_id=%s", task.BlockID, task.ItemID)
-
 		submitKey := SUBMITIDANSWERSUB + task.SubmitId
 		remaining, err := sc.redisClient.Decr(context.Background(), submitKey).Result()
 		if err != nil {
@@ -407,11 +403,15 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 			continue
 		}
 
+		resultJSON, _ := json.Marshal(resultItem)
+		sc.redisClient.RPush(ctx, "submit:result:"+task.SubmitId, resultJSON)
+		log.Printf("[SubmitAnswerWorker] RPush result: block_id=%s item_id=%s", task.BlockID, task.ItemID)
+
 		if remaining <= 0 {
 			lockKey := "submit:lock:" + task.SubmitId
 			ok, _ := sc.redisClient.SetNX(context.Background(), lockKey, "1", 5*time.Second).Result()
 			if ok {
-				time.Sleep(1000 * time.Millisecond)
+				time.Sleep(2000 * time.Millisecond)
 				resultKey := "submit:result:" + task.SubmitId
 				resultList, err := sc.redisClient.LRange(context.Background(), "submit:result:"+task.SubmitId, 0, -1).Result()
 				if err != nil {
