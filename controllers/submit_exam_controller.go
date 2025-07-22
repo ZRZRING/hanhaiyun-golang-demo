@@ -52,6 +52,7 @@ type SubmitExamRequest struct {
 type Item struct {
 	ItemID    string `json:"item_id" validate:"required"`    // Question ID
 	Body      string `json:"body" validate:"required"`       // Question body
+	Analysis  string `json:"analysis" validate:"required"`   // Question analysis
 	Answer    string `json:"answer" validate:"required"`     // Question answer
 	FullScore string `json:"full_score" validate:"required"` // Maximum score for the question
 }
@@ -70,9 +71,10 @@ type StudentAnswer struct {
 }
 
 type ExamItemTask struct {
-	ExamID    string `json:"exam_id" validate:"required"`    // Exam ID
-	ItemID    string `json:"item_id" validate:"required"`    // Question ID
-	Body      string `json:"body" validate:"required"`       // Question body
+	ExamID    string `json:"exam_id" validate:"required"` // Exam ID
+	ItemID    string `json:"item_id" validate:"required"` // Question ID
+	Body      string `json:"body" validate:"required"`    // Question body
+	Analysis  string `json:"analysis" validate:"required"`
 	Answer    string `json:"answer" validate:"required"`     // Question answer
 	SubmitId  string `json:"submit_id" validate:"required"`  // Unique ID for the submission
 	CallBack  string `json:"callback" validate:"required"`   // Callback URL for result notification
@@ -124,6 +126,7 @@ func (sc *SubmitExamCase) SubmitExamController(c *fiber.Ctx) error {
 			ItemID:    item.ItemID,
 			Body:      item.Body,
 			Answer:    item.Answer,
+			Analysis:  item.Analysis,
 			FullScore: item.FullScore,
 			CallBack:  req.Callback,
 			SubmitId:  submitId,
@@ -177,6 +180,7 @@ func (sc *SubmitExamCase) SubmitExamWorker() {
 		bizParams := map[string]interface{}{
 			"answer":     examTask.Answer,
 			"full_score": examTask.FullScore,
+			"analysis":   examTask.Analysis,
 		}
 		// 处理 answer
 		answerResp, err := utils.RetryAgentRequest(HANDLEANSWERAPPID, bizParams, 3)
