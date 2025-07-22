@@ -15,7 +15,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strconv"
 	"time"
 )
 
@@ -88,6 +87,16 @@ type ExamStudentAnswerTask struct {
 	Answers   []string `json:"answer" validate:"required,dive,url"` // Student's answer list (image URLs)
 	SubmitId  string   `json:"submit_id" validate:"required"`       // Unique ID for the submission
 	Callback  string   `json:"callback" validate:"required,url"`    // Callback URL for result notification
+}
+
+type ExamBlockResponse struct {
+	BlockID   string `json:"block_id"`   // Unique ID for the answer block
+	ItemID    string `json:"item_id"`    // Question ID
+	StudentID string `json:"student_id"` // Student ID
+	Result    string `json:"result"`     // Result of the answer evaluation
+	Score     string `json:"score"`      // Score awarded for the answer
+	FullScore string `json:"full_score"` // Maximum score for the question
+	Status    string `json:"status"`     // Status of the evaluation (e.g., "success", "failed")
 }
 
 func (sc *SubmitExamCase) SubmitExamController(c *fiber.Ctx) error {
@@ -169,7 +178,6 @@ func (sc *SubmitExamCase) SubmitExamWorker() {
 			"answer":     examTask.Answer,
 			"full_score": examTask.FullScore,
 		}
-
 		// 处理 answer
 		answerResp, err := utils.RetryAgentRequest(HANDLEANSWERAPPID, bizParams, 3)
 		if err != nil {
@@ -241,11 +249,12 @@ func (sc *SubmitExamCase) SubmitAnswerController(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusInternalServerError, "DB error")
 	}
 
+	// todo : 换成批量插入
 	for _, ans := range req.StudentAnswers {
 		query := `INSERT INTO exam_blocks 
-			(block_id, exam_id, student_id, item_id, answer, callback, status) 
-			VALUES ($1, $2, $3, $4, $5, $6, 'pending')`
-		_, err := tx.Exec(query, ans.BlockID, req.ExamID, ans.StudentID, ans.ItemID, pq.Array(ans.AnswerList), req.Callback)
+			(submit_id, block_id, exam_id, student_id, item_id, answer, callback, status) 
+			VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')`
+		_, err := tx.Exec(query, submitId, ans.BlockID, req.ExamID, ans.StudentID, ans.ItemID, pq.Array(ans.AnswerList), req.Callback)
 		if err != nil {
 			tx.Rollback()
 			log.Printf("[SubmitAnswerController] Insert failed for student answer: %v", err)
@@ -323,13 +332,6 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 			log.Printf("Process successful!")
 			taskResultText = taskResult.Text
 		}
-		// 更新数据库
-		updateQuery := `UPDATE exam_blocks SET status = 'completed', result = $1 WHERE block_id = $2`
-		_, err = sc.db.Exec(updateQuery, taskResultText, task.BlockID)
-		if err != nil {
-			log.Printf("[SubmitAnswerWorker] Failed to update exam block: %v", err)
-			continue
-		}
 		// 请求百炼智能体 分析分数
 		scoreRequestRetryCount := 3
 		//scoreRes, err := utils.RetryAgentRequest(HANDLESCOREAPPID, map[string]interface{}{
@@ -386,46 +388,43 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 			scoreResult.FullScore = "0"
 			scoreResult.Score = "0"
 		}
-
-		resultItem := map[string]string{
-			"block_id":   task.BlockID,
-			"item_id":    task.ItemID,
-			"student_id": task.StudentID,
-			"result":     taskResultText,
-			"score":      scoreResult.Score,
-			"full_score": scoreResult.FullScore,
-			"status":     strconv.FormatBool(isSuccess),
-		}
 		submitKey := SUBMITIDANSWERSUB + task.SubmitId
 		remaining, err := sc.redisClient.Decr(context.Background(), submitKey).Result()
+
+		// update db
+		updateQuery := `UPDATE exam_blocks SET status = 'completed', score = $1, full_score = $2, result = $3 WHERE submit_id = $4`
+		_, err = sc.db.Exec(updateQuery, scoreResult.Score, scoreResult.FullScore, taskResultText, task.SubmitId)
 		if err != nil {
-			log.Printf("[SubmitAnswerWorker] Redis DECR error: %v", err)
+			log.Printf("[SubmitAnswerWorker] Failed to update exam block: %v", err)
 			continue
 		}
-
-		resultJSON, _ := json.Marshal(resultItem)
-		_, err = sc.redisClient.RPush(ctx, "submit:result:"+task.SubmitId, resultJSON).Result()
-		if err != nil {
-			log.Printf("[SubmitAnswerWorker] Redis RPush error: %v, block_id = %s", err, task.BlockID)
-		}
-		log.Printf("[SubmitAnswerWorker] RPush result: block_id=%s item_id=%s", task.BlockID, task.ItemID)
 
 		if remaining <= 0 {
 			lockKey := "submit:lock:" + task.SubmitId
 			ok, _ := sc.redisClient.SetNX(context.Background(), lockKey, "1", 5*time.Second).Result()
 			if ok {
 				time.Sleep(2000 * time.Millisecond)
-				resultKey := "submit:result:" + task.SubmitId
-				resultList, err := sc.redisClient.LRange(context.Background(), "submit:result:"+task.SubmitId, 0, -1).Result()
+				examBlocksList, err := sc.listExamBlocksBySubmitId(task.SubmitId)
 				if err != nil {
-					log.Printf("[SubmitAnswerWorker] Redis LRange error: %v", err)
-					return
+					log.Printf("[prepareResultList] Failed to marshal block: %v", err)
+				}
+
+				for i, _ := range examBlocksList {
+					log.Printf("[prepareResultList] Block %d: %+v \n", i, examBlocksList[i])
+				}
+				var resultList []string
+				for _, block := range examBlocksList {
+					jsonBytes, err := json.Marshal(block)
+					if err != nil {
+						log.Printf("[prepareResultList] Failed to marshal block: %v", err)
+						continue
+					}
+					resultList = append(resultList, string(jsonBytes))
 				}
 
 				sc.notifyCallback(task, resultList)
 
 				sc.redisClient.Del(context.Background(), SUBMITIDANSWERSUB+task.SubmitId)
-				sc.redisClient.Del(context.Background(), resultKey)
 				sc.redisClient.Del(context.Background(), lockKey)
 			}
 		}
@@ -520,4 +519,42 @@ func (sc *SubmitExamCase) notifyExamCallback(task ExamItemTask) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		log.Printf("[notifyExamCallback] Callback returned non-200 status: %d", resp.StatusCode)
 	}
+}
+
+func (sc *SubmitExamCase) listExamBlocksBySubmitId(submitId string) ([]ExamBlockResponse, error) {
+	query := `SELECT block_id, item_id, student_id, result, score, full_score, status 
+				  FROM exam_blocks WHERE submit_id = $1`
+
+	rows, err := sc.db.Query(query, submitId)
+	if err != nil {
+		log.Printf("[listExamBlocksBySubmitId] Query error: %v", err)
+		return nil, err
+	}
+	defer rows.Close()
+
+	examBlocks := make([]ExamBlockResponse, 0)
+	for rows.Next() {
+		var block ExamBlockResponse
+		err := rows.Scan(
+			&block.BlockID,
+			&block.ItemID,
+			&block.StudentID,
+			&block.Result,
+			&block.Score,
+			&block.FullScore,
+			&block.Status,
+		)
+		if err != nil {
+			log.Printf("[listExamBlocksBySubmitId] Scan error: %v", err)
+			continue // 或者 return nil, err 取决于您的错误处理策略
+		}
+		examBlocks = append(examBlocks, block)
+	}
+
+	// 检查遍历过程中是否有错误
+	if err = rows.Err(); err != nil {
+		log.Printf("[listExamBlocksBySubmitId] Rows iteration error: %v", err)
+		return nil, err
+	}
+	return examBlocks, nil
 }
