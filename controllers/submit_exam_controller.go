@@ -224,7 +224,7 @@ func (sc *SubmitExamCase) SubmitExamWorker() {
 
 		if remaining <= 0 {
 			lockKey := "submit_exam:lock:" + examTask.SubmitId
-			ok, _ := sc.redisClient.SetNX(ctx, lockKey, "1", 5*time.Second).Result()
+			ok, _ := sc.redisClient.SetNX(ctx, lockKey, "1", 40*time.Second).Result()
 			if ok {
 				// 执行回调
 				sc.notifyExamCallback(examTask)
@@ -411,10 +411,6 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 				examBlocksList, err := sc.listExamBlocksBySubmitId(task.SubmitId)
 				if err != nil {
 					log.Printf("[prepareResultList] Failed to marshal block: %v", err)
-				}
-
-				for i, _ := range examBlocksList {
-					log.Printf("[prepareResultList] Block %d: %+v \n", i, examBlocksList[i])
 				}
 				var resultList []string
 				for _, block := range examBlocksList {
