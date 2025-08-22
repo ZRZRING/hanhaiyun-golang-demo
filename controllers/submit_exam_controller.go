@@ -396,8 +396,8 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 		remaining, err := sc.redisClient.Decr(context.Background(), submitKey).Result()
 
 		// update db
-		updateQuery := `UPDATE exam_blocks SET status = 'true', score = $1, full_score = $2, result = $3 WHERE submit_id = $4`
-		_, err = sc.db.Exec(updateQuery, scoreResult.Score, scoreResult.FullScore, taskResultText, task.SubmitId)
+		updateQuery := `UPDATE exam_blocks SET status = 'true', score = $1, full_score = $2, result = $3 WHERE submit_id = $4 AND block_id = $5`
+		_, err = sc.db.Exec(updateQuery, scoreResult.Score, scoreResult.FullScore, taskResultText, task.SubmitId, task.BlockID)
 		if err != nil {
 			log.Printf("[SubmitAnswerWorker] Failed to update exam block: %v", err)
 			continue
