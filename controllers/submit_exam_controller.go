@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"examination-papers/data/storage"
 	"examination-papers/utils"
+	"fmt"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
@@ -15,6 +16,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -247,7 +249,12 @@ func (sc *SubmitExamCase) SubmitAnswerController(c *fiber.Ctx) error {
 	}
 
 	submitId := uuid.NewString()
-	sc.redisClient.Set(context.Background(), SUBMITIDANSWERSUB+submitId, len(req.StudentAnswers), 120*time.Second) // 2小时过期
+	initialCount := len(req.StudentAnswers)
+	sc.redisClient.Set(context.Background(), SUBMITIDANSWERSUB+submitId, initialCount, 120*time.Second) // 2小时过期
+
+	// 额外记录初始任务数量，用于后续判断
+	initialCountKey := fmt.Sprintf("initial_count:%s", submitId)
+	sc.redisClient.Set(context.Background(), initialCountKey, initialCount, 120*time.Second)
 
 	tx, err := sc.db.Beginx()
 	if err != nil {
@@ -403,14 +410,27 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 		}
 
 		submitKey := SUBMITIDANSWERSUB + task.SubmitId
+		initialCountKey := fmt.Sprintf("initial_count:%s", task.SubmitId)
 		remaining, err := sc.redisClient.Decr(context.Background(), submitKey).Result()
 		log.Printf("[SubmitAnswerWorker] Remaining tasks for SubmitID %s: %d", task.SubmitId, remaining)
 		if err != nil {
 			log.Printf("[SubmitAnswerWorker] Redis Decr error: %v", err)
 			continue
 		}
+		// 获取初始任务数量
+		initialCountStr := sc.redisClient.Get(context.Background(), initialCountKey).Val()
+		if initialCountStr == "" {
+			log.Printf("[SubmitAnswerWorker] Could not get initial count for SubmitID: %s", task.SubmitId)
+			continue
+		}
 
-		if remaining == -1 {
+		initialCount, err := strconv.Atoi(initialCountStr)
+		if err != nil {
+			log.Printf("[SubmitAnswerWorker] Invalid initial count: %s", initialCountStr)
+			continue
+		}
+		expectedFinalValue := int64(-initialCount)
+		if remaining == expectedFinalValue {
 			lockKey := "submit:lock:" + task.SubmitId
 			ok, _ := sc.redisClient.SetNX(context.Background(), lockKey, "1", 30*time.Second).Result()
 			if ok {
