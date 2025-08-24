@@ -119,6 +119,7 @@ func (sc *SubmitExamCase) SubmitExamController(c *fiber.Ctx) error {
 	}
 	ctx := context.Background()
 	submitId := uuid.NewString()
+	log.Printf("[SubmitExamController] len items: %d", len(req.Items))
 	sc.redisClient.Set(ctx, SUBMITIDEXAMSUB+submitId, len(req.Items), 4*time.Hour)
 	for _, item := range req.Items {
 		task := ExamItemTask{
@@ -403,12 +404,13 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 
 		submitKey := SUBMITIDANSWERSUB + task.SubmitId
 		remaining, err := sc.redisClient.Decr(context.Background(), submitKey).Result()
+		log.Printf("[SubmitAnswerWorker] Remaining tasks for SubmitID %s: %d", task.SubmitId, remaining)
 		if err != nil {
 			log.Printf("[SubmitAnswerWorker] Redis Decr error: %v", err)
 			continue
 		}
 
-		if remaining == 0 {
+		if remaining == -1 {
 			lockKey := "submit:lock:" + task.SubmitId
 			ok, _ := sc.redisClient.SetNX(context.Background(), lockKey, "1", 30*time.Second).Result()
 			if ok {
