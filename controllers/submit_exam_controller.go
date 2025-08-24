@@ -392,8 +392,6 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 			scoreResult.FullScore = "0"
 			scoreResult.Score = "0"
 		}
-		submitKey := SUBMITIDANSWERSUB + task.SubmitId
-		remaining, err := sc.redisClient.Decr(context.Background(), submitKey).Result()
 
 		// update db
 		updateQuery := `UPDATE exam_blocks SET status = 'true', score = $1, full_score = $2, result = $3 WHERE submit_id = $4 AND block_id = $5`
@@ -403,11 +401,19 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 			continue
 		}
 
-		if remaining <= 0 {
+		submitKey := SUBMITIDANSWERSUB + task.SubmitId
+		remaining, err := sc.redisClient.Decr(context.Background(), submitKey).Result()
+		if err != nil {
+			log.Printf("[SubmitAnswerWorker] Redis Decr error: %v", err)
+			continue
+		}
+
+		if remaining == 0 {
 			lockKey := "submit:lock:" + task.SubmitId
-			ok, _ := sc.redisClient.SetNX(context.Background(), lockKey, "1", 5*time.Second).Result()
+			ok, _ := sc.redisClient.SetNX(context.Background(), lockKey, "1", 30*time.Second).Result()
 			if ok {
-				time.Sleep(2000 * time.Millisecond)
+				time.Sleep(1 * time.Second)
+				log.Printf("[SubmitAnswerWorker] All tasks completed for SubmitID: %s, preparing callback", task.SubmitId)
 				examBlocksList, err := sc.listExamBlocksBySubmitId(task.SubmitId)
 				if err != nil {
 					log.Printf("[prepareResultList] Failed to marshal block: %v", err)
@@ -522,8 +528,13 @@ func (sc *SubmitExamCase) notifyExamCallback(task ExamItemTask) {
 }
 
 func (sc *SubmitExamCase) listExamBlocksBySubmitId(submitId string) ([]ExamBlockResponse, error) {
-	query := `SELECT block_id, item_id, student_id, result, score, full_score, status 
-				  FROM exam_blocks WHERE submit_id = $1`
+	query := `SELECT block_id, item_id, student_id, 
+           COALESCE(result, '处理失败，请检查！') as result, 
+           COALESCE(score, '0') as score, 
+           COALESCE(full_score, '0') as full_score, 
+           status
+           FROM exam_blocks WHERE submit_id = $1
+           ORDER BY block_id`
 
 	rows, err := sc.db.Query(query, submitId)
 	if err != nil {
