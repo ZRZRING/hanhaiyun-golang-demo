@@ -16,7 +16,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strconv"
 	"time"
 )
 
@@ -291,6 +290,7 @@ func (sc *SubmitExamCase) SubmitAnswerController(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusInternalServerError, "Commit failed")
 	}
 
+	go sc.monitorSubmitCallback(submitId, req.Callback, req.ExamID)
 	return c.JSON(fiber.Map{
 		"code":    0,
 		"message": "Submitted successfully",
@@ -323,6 +323,7 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 		var bodyResult, correctAnswerResult string
 		err = sc.db.QueryRow(query, task.ItemID).Scan(&bodyResult, &correctAnswerResult)
 		if err != nil {
+			// todo : 题目不存在，更新状态为 failed
 			log.Printf("[SubmitAnswerWorker] Failed to fetch item details: %v", err)
 			continue
 		}
@@ -401,61 +402,68 @@ func (sc *SubmitExamCase) SubmitAnswerWorker() {
 			scoreResult.Score = "0"
 		}
 
+		var status string
+		if isSuccess {
+			status = "true"
+		} else {
+			status = "failed"
+		}
+
 		// update db
-		updateQuery := `UPDATE exam_blocks SET status = 'true', score = $1, full_score = $2, result = $3 WHERE submit_id = $4 AND block_id = $5`
-		_, err = sc.db.Exec(updateQuery, scoreResult.Score, scoreResult.FullScore, taskResultText, task.SubmitId, task.BlockID)
+		updateQuery := `UPDATE exam_blocks SET status = $1, score = $2, full_score = $3, result = $4 WHERE submit_id = $5 AND block_id = $6`
+		_, err = sc.db.Exec(updateQuery, status, scoreResult.Score, scoreResult.FullScore, taskResultText, task.SubmitId, task.BlockID)
 		if err != nil {
 			log.Printf("[SubmitAnswerWorker] Failed to update exam block: %v", err)
 			continue
 		}
 
-		submitKey := SUBMITIDANSWERSUB + task.SubmitId
-		initialCountKey := fmt.Sprintf("initial_count:%s", task.SubmitId)
-		remaining, err := sc.redisClient.Decr(context.Background(), submitKey).Result()
-		log.Printf("[SubmitAnswerWorker] Remaining tasks for SubmitID %s: %d", task.SubmitId, remaining)
-		if err != nil {
-			log.Printf("[SubmitAnswerWorker] Redis Decr error: %v", err)
-			continue
-		}
-		// 获取初始任务数量
-		initialCountStr := sc.redisClient.Get(context.Background(), initialCountKey).Val()
-		if initialCountStr == "" {
-			log.Printf("[SubmitAnswerWorker] Could not get initial count for SubmitID: %s", task.SubmitId)
-			continue
-		}
-
-		initialCount, err := strconv.Atoi(initialCountStr)
-		if err != nil {
-			log.Printf("[SubmitAnswerWorker] Invalid initial count: %s", initialCountStr)
-			continue
-		}
-		expectedFinalValue := int64(-initialCount)
-		if remaining == expectedFinalValue {
-			lockKey := "submit:lock:" + task.SubmitId
-			ok, _ := sc.redisClient.SetNX(context.Background(), lockKey, "1", 30*time.Second).Result()
-			if ok {
-				time.Sleep(1 * time.Second)
-				log.Printf("[SubmitAnswerWorker] All tasks completed for SubmitID: %s, preparing callback", task.SubmitId)
-				examBlocksList, err := sc.listExamBlocksBySubmitId(task.SubmitId)
-				if err != nil {
-					log.Printf("[prepareResultList] Failed to marshal block: %v", err)
-				}
-				var resultList []string
-				for _, block := range examBlocksList {
-					jsonBytes, err := json.Marshal(block)
-					if err != nil {
-						log.Printf("[prepareResultList] Failed to marshal block: %v", err)
-						continue
-					}
-					resultList = append(resultList, string(jsonBytes))
-				}
-
-				sc.notifyCallback(task, resultList)
-
-				sc.redisClient.Del(context.Background(), SUBMITIDANSWERSUB+task.SubmitId)
-				sc.redisClient.Del(context.Background(), lockKey)
-			}
-		}
+		//submitKey := SUBMITIDANSWERSUB + task.SubmitId
+		//initialCountKey := fmt.Sprintf("initial_count:%s", task.SubmitId)
+		//remaining, err := sc.redisClient.Decr(context.Background(), submitKey).Result()
+		//log.Printf("[SubmitAnswerWorker] Remaining tasks for SubmitID %s: %d", task.SubmitId, remaining)
+		//if err != nil {
+		//	log.Printf("[SubmitAnswerWorker] Redis Decr error: %v", err)
+		//	continue
+		//}
+		//// 获取初始任务数量
+		//initialCountStr := sc.redisClient.Get(context.Background(), initialCountKey).Val()
+		//if initialCountStr == "" {
+		//	log.Printf("[SubmitAnswerWorker] Could not get initial count for SubmitID: %s", task.SubmitId)
+		//	continue
+		//}
+		//
+		//initialCount, err := strconv.Atoi(initialCountStr)
+		//if err != nil {
+		//	log.Printf("[SubmitAnswerWorker] Invalid initial count: %s", initialCountStr)
+		//	continue
+		//}
+		//expectedFinalValue := int64(-initialCount)
+		//if remaining == expectedFinalValue {
+		//	lockKey := "submit:lock:" + task.SubmitId
+		//	ok, _ := sc.redisClient.SetNX(context.Background(), lockKey, "1", 30*time.Second).Result()
+		//	if ok {
+		//		time.Sleep(1 * time.Second)
+		//		log.Printf("[SubmitAnswerWorker] All tasks completed for SubmitID: %s, preparing callback", task.SubmitId)
+		//		examBlocksList, err := sc.listExamBlocksBySubmitId(task.SubmitId)
+		//		if err != nil {
+		//			log.Printf("[prepareResultList] Failed to marshal block: %v", err)
+		//		}
+		//		var resultList []string
+		//		for _, block := range examBlocksList {
+		//			jsonBytes, err := json.Marshal(block)
+		//			if err != nil {
+		//				log.Printf("[prepareResultList] Failed to marshal block: %v", err)
+		//				continue
+		//			}
+		//			resultList = append(resultList, string(jsonBytes))
+		//		}
+		//
+		//		sc.notifyCallback(task, resultList)
+		//
+		//		sc.redisClient.Del(context.Background(), SUBMITIDANSWERSUB+task.SubmitId)
+		//		sc.redisClient.Del(context.Background(), lockKey)
+		//	}
+		//}
 	}
 }
 
@@ -590,4 +598,61 @@ func (sc *SubmitExamCase) listExamBlocksBySubmitId(submitId string) ([]ExamBlock
 		return nil, err
 	}
 	return examBlocks, nil
+}
+
+func (sc *SubmitExamCase) monitorSubmitCallback(submitId, callback, examId string) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	log.Printf("[Monitor] Started monitoring for SubmitID: %s", submitId)
+
+	for {
+		select {
+		case <-ticker.C:
+			// 检查数据库中这个submitId下还有多少pending状态的任务
+			var pendingCount int
+			query := `SELECT COUNT(*) FROM exam_blocks WHERE submit_id = $1 AND status = 'pending'`
+			err := sc.db.QueryRow(query, submitId).Scan(&pendingCount)
+			if err != nil {
+				log.Printf("[Monitor] Query error for %s: %v", submitId, err)
+				continue
+			}
+
+			log.Printf("[Monitor] SubmitID %s still has %d pending tasks", submitId, pendingCount)
+
+			// 如果没有pending的任务了，说明都完成了
+			if pendingCount == 0 {
+				log.Printf("[Monitor] All tasks completed for %s, executing callback", submitId)
+				sc.executeCallback(submitId, callback, examId)
+				log.Printf("[Monitor] Callback completed for %s, goroutine exiting", submitId)
+				return // goroutine自杀
+			}
+		}
+	}
+}
+
+func (sc *SubmitExamCase) executeCallback(submitId, callback, examId string) {
+	// 获取这个submitId的所有结果
+	examBlocksList, err := sc.listExamBlocksBySubmitId(submitId)
+	if err != nil {
+		log.Printf("[executeCallback] Failed to get exam blocks: %v", err)
+		return
+	}
+
+	// 准备结果列表
+	var resultList []string
+	for _, block := range examBlocksList {
+		jsonBytes, _ := json.Marshal(block)
+		resultList = append(resultList, string(jsonBytes))
+	}
+
+	// 构造任务对象用于回调
+	task := ExamStudentAnswerTask{
+		Callback: callback,
+		SubmitId: submitId,
+		ExamID:   examId,
+	}
+
+	// 执行回调
+	sc.notifyCallback(task, resultList)
 }
