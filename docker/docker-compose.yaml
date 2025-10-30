@@ -2,7 +2,7 @@ services:
   pgsql:
     image: postgres:16
     ports:
-      - "25432:5432"
+      - "5432:5432"
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
